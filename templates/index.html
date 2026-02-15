@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html><head><title>Fase 1</title><script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-gray-900 text-white p-10">
+    <div class="max-w-4xl mx-auto">
+        <h1 class="text-4xl font-black text-blue-500 mb-10 italic">CRAWLER V3</h1>
+        <div class="grid grid-cols-3 gap-6 mb-10">
+            <div class="bg-gray-800 p-6 rounded-2xl border border-gray-700">
+                <p class="text-xs text-gray-500 font-bold uppercase">Database</p>
+                <h2 id="total" class="text-4xl font-bold mt-2">0</h2>
+            </div>
+            <div class="bg-gray-800 p-6 rounded-2xl border border-gray-700">
+                <p class="text-xs text-gray-500 font-bold uppercase">Live Kode</p>
+                <h2 id="kode" class="text-4xl font-bold mt-2 text-blue-400">000000</h2>
+            </div>
+            <div class="bg-gray-800 p-6 rounded-2xl border border-gray-700">
+                <p class="text-xs text-gray-500 font-bold uppercase">Status</p>
+                <h2 id="status" class="text-xl font-bold mt-4 uppercase tracking-widest">-</h2>
+            </div>
+        </div>
+        <div class="bg-gray-800 p-8 rounded-2xl border border-gray-700 mb-10 text-center">
+            <h2 id="loop" class="text-3xl font-mono text-yellow-500 font-bold">0/39 | 0/99 | 0/99</h2>
+        </div>
+        <div class="flex gap-4">
+            <a href="/start" class="flex-1 bg-emerald-600 py-4 rounded-xl font-black text-center text-lg shadow-lg">START</a>
+            <a href="/pause" class="flex-1 bg-rose-600 py-4 rounded-xl font-black text-center text-lg shadow-lg">PAUSE</a>
+        </div>
+        <div class="mt-8 flex gap-4">
+            <a href="/enrichment" class="flex-1 bg-cyan-700 py-3 rounded-xl font-bold text-center">FASE 2</a>
+            <a href="/viewer" class="flex-1 bg-indigo-700 py-3 rounded-xl font-bold text-center">VIEWER</a>
+        </div>
+    </div>
+    <script>
+        async function update(){
+            const r = await fetch('/api/stats'); const d = await r.json();
+            document.getElementById('total').innerText = d.total.toLocaleString();
+            document.getElementById('kode').innerText = d.live_kode;
+            document.getElementById('status').innerText = d.is_running ? "RUNNING" : "PAUSED";
+            document.getElementById('status').className = d.is_running ? "text-xl font-bold mt-4 text-emerald-500 uppercase tracking-widest" : "text-xl font-bold mt-4 text-rose-500 uppercase tracking-widest";
+            document.getElementById('loop').innerText = `${d.progress.p}/39 | ${d.progress.k}/99 | ${d.progress.kc}/99`;
+        }
+        setInterval(update, 2000); update();
+    </script>
+</body></html>

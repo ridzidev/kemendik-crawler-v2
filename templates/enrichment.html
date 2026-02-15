@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html><head><title>Fase 2</title><script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-slate-900 text-white p-10">
+    <div class="max-w-4xl mx-auto">
+        <h1 class="text-4xl font-black text-cyan-400 mb-10 text-center italic">FASE 2: ENRICHMENT</h1>
+        <div class="bg-slate-800 p-10 rounded-3xl border border-slate-700 shadow-2xl mb-10">
+            <div class="grid grid-cols-2 gap-10 text-center">
+                <div><p class="text-slate-500 uppercase text-xs font-bold mb-2">Terperkaya</p><h2 id="f2-done" class="text-7xl font-black">0</h2></div>
+                <div><p class="text-slate-500 uppercase text-xs font-bold mb-2">Live NPSN</p><h2 id="live-npsn" class="text-6xl font-black text-cyan-500 font-mono italic tracking-tighter">IDLE</h2></div>
+            </div>
+            <div class="mt-12 flex gap-4">
+                <a href="/fase2/start" class="flex-1 bg-cyan-600 py-5 rounded-2xl font-black text-center text-xl shadow-lg">START</a>
+                <a href="/fase2/pause" class="flex-1 bg-rose-600 py-5 rounded-2xl font-black text-center text-xl shadow-lg">PAUSE</a>
+            </div>
+        </div>
+        <a href="/" class="block text-center text-slate-500 font-bold hover:text-white transition">KEMBALI KE FASE 1</a>
+    </div>
+    <script>
+        async function update(){
+            const r = await fetch('/api/stats'); const d = await r.json();
+            document.getElementById('f2-done').innerText = d.fase2_done.toLocaleString();
+            document.getElementById('live-npsn').innerText = d.live_npsn;
+        }
+        setInterval(update, 2000); update();
+    </script>
+</body></html>
