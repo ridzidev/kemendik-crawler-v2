@@ -19,7 +19,6 @@ def viewer():
     per_page = 100
     offset = (page - 1) * per_page
     conn = get_connection()
-    
     total_all = conn.execute("SELECT COUNT(*) as t FROM sekolah").fetchone()['t']
     total_enriched = conn.execute("SELECT COUNT(*) as t FROM sekolah WHERE fase2_done=1").fetchone()['t']
     
@@ -30,7 +29,6 @@ def viewer():
     rows = conn.execute(q + "ORDER BY id DESC LIMIT ? OFFSET ?", (per_page, offset)).fetchall()
     total_filtered = conn.execute(q.replace("SELECT *", "SELECT COUNT(*) as t")).fetchone()['t']
     conn.close()
-    
     return render_template("viewer.html", rows=rows, total_data=total_all, total_enriched=total_enriched, pending=(total_all-total_enriched), page=page, total_pages=(total_filtered//per_page)+1, search=search, view_filter=view_filter)
 
 @app.route("/api/stats")
@@ -40,14 +38,7 @@ def stats():
     f2 = conn.execute("SELECT COUNT(*) as t FROM sekolah WHERE fase2_done=1").fetchone()['t']
     p = conn.execute("SELECT * FROM progress WHERE id=1").fetchone()
     conn.close()
-    return jsonify({
-        "total": t, "fase2_done": f2, 
-        "is_running": crawler_instance.is_active, 
-        "fase2_running": crawler_instance.fase2_active, 
-        "live_kode": crawler_instance.live_kode, 
-        "live_npsn": crawler_instance.live_npsn,
-        "progress": {"p": p['prov'], "k": p['kab'], "kc": p['kec']}
-    })
+    return jsonify({"total": t, "fase2_done": f2, "is_running": crawler_instance.is_active, "fase2_running": crawler_instance.fase2_active, "live_kode": crawler_instance.live_kode, "live_npsn": crawler_instance.live_npsn, "progress": {"p": p['prov'], "k": p['kab'], "kc": p['kec']}})
 
 @app.route("/start")
 def start():

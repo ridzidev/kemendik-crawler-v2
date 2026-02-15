@@ -3,12 +3,14 @@ import time
 import re
 from bs4 import BeautifulSoup
 from db import get_connection
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class KemendikCrawler:
-    def __init__(self, max_workers=8):
+    def __init__(self, max_workers=15):
         self.base_url = "https://referensi.data.kemendikdasmen.go.id"
         self.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=max_workers, pool_maxsize=max_workers)
+        self.session.mount('https://', adapter)
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         })
@@ -16,35 +18,46 @@ class KemendikCrawler:
         self.is_active = False
         self.fase2_active = False
         self.live_kode = "000000"
-        self.live_npsn = "IDLE"
+        self.live_npsn = "Pending"
 
-    # --- FASE 1: BRUTE FORCE ---
+    # --- HELPER UPDATE PROGRESS KE DB ---
+    def update_db_progress(self, p, k, kc):
+        try:
+            with get_connection() as conn:
+                conn.execute("UPDATE progress SET prov=?, kab=?, kec=? WHERE id=1", (p, k, kc))
+                conn.commit()
+        except: pass
+
+    # --- FASE 1: WORKER ---
     def fetch_kecamatan(self, p, k, kc):
         if not self.is_active: return
         kode6 = f"{p:02}{k:02}{kc:02}"
         self.live_kode = kode6
         
+        url = f"{self.base_url}/pendidikan/dikdas/{kode6}/3"
         try:
-            url = f"{self.base_url}/pendidikan/dikdas/{kode6}/3"
-            resp = self.session.get(url, timeout=15)
-            if resp.status_code != 200 or "Data tidak ditemukan" in resp.text: return
+            resp = self.session.get(url, timeout=10)
+            if resp.status_code != 200 or "Data tidak ditemukan" in resp.text:
+                self.update_db_progress(p, k, kc)
+                return
             
             soup = BeautifulSoup(resp.text, "html.parser")
-            
-            # Parsing Breadcrumb (Nama Asli)
             prov_n, kab_n, kec_n = f"PROV_{p:02}", f"KAB_{k:02}", f"KEC_{kc:02}"
-            bc = soup.find(lambda tag: tag.name == "div" and "Indonesia" in tag.text)
-            if bc:
-                txt = bc.get_text(strip=True)
-                parts = [p.strip() for p in re.split(r'>>|»', txt)]
+            
+            # Parsing Breadcrumb (Anti-Trim)
+            bc_el = soup.find(lambda tag: tag.name == "div" and "Indonesia" in tag.text)
+            if bc_el:
+                parts = [x.strip() for x in re.split(r'>>|»', bc_el.get_text(strip=True))]
                 if len(parts) > 1: prov_n = parts[1]
                 if len(parts) > 2: kab_n = parts[2]
                 if len(parts) > 3: kec_n = parts[3].split("DAFTAR")[0].strip()
 
             table = soup.find("table", {"id": "table1"})
-            if not table: return
-            rows = table.find("tbody").find_all("tr")
+            if not table: 
+                self.update_db_progress(p, k, kc)
+                return
             
+            rows = table.find("tbody").find_all("tr")
             batch = []
             for row in rows:
                 c = row.find_all("td")
@@ -59,37 +72,48 @@ class KemendikCrawler:
                     conn.executemany("""INSERT OR IGNORE INTO sekolah 
                     (npsn, nama, status, bentuk_pendidikan, alamat, desa, kecamatan, kabupaten, provinsi) 
                     VALUES (?,?,?,?,?,?,?,?,?)""", batch)
-                    conn.execute("UPDATE progress SET prov=?, kab=?, kec=? WHERE id=1", (p, k, kc))
                     conn.commit()
-        except: pass
+            
+            self.update_db_progress(p, k, kc)
+        except:
+            self.update_db_progress(p, k, kc)
 
     def run_f1(self):
         self.is_active = True
         with get_connection() as conn:
-            prog = conn.execute("SELECT * FROM progress WHERE id=1").fetchone()
+            prg = conn.execute("SELECT * FROM progress WHERE id=1").fetchone()
         
-        for p in range(prog['prov'], 40):
-            if not self.is_active: break
-            for k in range(prog['kab'] if p == prog['prov'] else 1, 100):
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            for p in range(prg['prov'], 40):
                 if not self.is_active: break
-                for kc in range(prog['kec'] if (p == prog['prov'] and k == prog['kab']) else 1, 100):
+                for k in range(prg['kab'] if p == prg['prov'] else 1, 100):
                     if not self.is_active: break
-                    self.fetch_kecamatan(p, k, kc)
-                    time.sleep(0.05)
+                    
+                    futures = []
+                    start_kc = prg['kec'] if (p == prg['prov'] and k == prg['kab']) else 1
+                    for kc in range(start_kc, 100):
+                        if not self.is_active: break
+                        futures.append(executor.submit(self.fetch_kecamatan, p, k, kc))
+                    
+                    # Cek hasil dan berikan kesempatan untuk Pause
+                    for future in as_completed(futures):
+                        if not self.is_active:
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            return
+            
         self.is_active = False
 
-    # --- FASE 2: FULL ENRICHMENT (SEMUA KOLOM) ---
+    # --- FASE 2: FULL DATA ENRICHMENT ---
     def fetch_detail(self, npsn):
         if not self.fase2_active: return
         self.live_npsn = npsn
+        url = f"{self.base_url}/tabs.php?npsn={npsn}"
         try:
-            url = f"{self.base_url}/tabs.php?npsn={npsn}"
             resp = self.session.get(url, timeout=20)
             if resp.status_code != 200: return
             soup = BeautifulSoup(resp.text, "html.parser")
 
             def g(label):
-                # Cari TD yang teksnya pas banget sama label, lalu ambil TD sebelahnya
                 target = soup.find("td", string=re.compile(f"^{label}$", re.I))
                 if target:
                     val_td = target.find_next_sibling("td")
@@ -98,31 +122,33 @@ class KemendikCrawler:
                     return val_td.get_text(strip=True) if val_td else ""
                 return ""
 
-            # Logika khusus Internet
+            # Internet
             i1, i2 = "", ""
             itd = soup.find("td", string=re.compile("Akses Internet", re.I))
             if itd:
                 i1 = itd.find_next_sibling("td").find_next_sibling("td").text.strip()
                 row2 = itd.find_parent("tr").find_next_sibling("tr")
-                if row2: i2 = row2.find_all("td")[-1].text.strip()
+                if row2:
+                    c2 = row2.find_all("td")
+                    if len(c2) > 0: i2 = c2[-1].text.strip()
 
-            # Mapping Data
-            data = {
-                'link': soup.select_one("a[href*='profil-sekolah']")['href'] if soup.select_one("a[href*='profil-sekolah']") else "",
-                'bp_d': g("Bentuk Pendidikan"),
-                'pembina': g("Kementerian Pembina"),
-                'naungan': g("Naungan"),
+            # Mapping SEMUA Kolom
+            d = {
+                'nlink': soup.select_one("a[href*='profil-sekolah']")['href'] if soup.select_one("a[href*='profil-sekolah']") else "",
+                'bpd': g("Bentuk Pendidikan"),
+                'pemb': g("Kementerian Pembina"),
+                'naung': g("Naungan"),
                 'npyp': g("NPYP"),
-                'sk_p': g("No. SK. Pendirian"),
-                'tgl_p': g("Tanggal SK. Pendirian"),
-                'sk_o': g("Nomor SK Operasional"),
-                'tgl_o': g("Tanggal SK Operasional"),
-                'sk_l': soup.find("a", string=re.compile("Lihat SK Operasional", re.I))['href'] if soup.find("a", string=re.compile("Lihat SK Operasional", re.I)) else "",
-                'tgl_u': g("Tanggal Upload SK Op."),
+                'skp': g("No. SK. Pendirian"),
+                'tglp': g("Tanggal SK. Pendirian"),
+                'sko': g("Nomor SK Operasional"),
+                'tglo': g("Tanggal SK Operasional"),
+                'skol': soup.find("a", string=re.compile("Lihat SK Operasional", re.I))['href'] if soup.find("a", string=re.compile("Lihat SK Operasional", re.I)) else "",
+                'tglu': g("Tanggal Upload SK Op."),
                 'akr': soup.find("a", href=re.compile("ban-pdm|satuanpendidikan", re.I)).text.strip() if soup.find("a", href=re.compile("ban-pdm|satuanpendidikan", re.I)) else "",
-                'akr_l': soup.find("a", href=re.compile("ban-pdm|satuanpendidikan", re.I))['href'] if soup.find("a", href=re.compile("ban-pdm|satuanpendidikan", re.I)) else "",
+                'akrl': soup.find("a", href=re.compile("ban-pdm|satuanpendidikan", re.I))['href'] if soup.find("a", href=re.compile("ban-pdm|satuanpendidikan", re.I)) else "",
                 'luas': g("Luas Tanah"),
-                'listrik': g("Sumber Listrik"),
+                'list': g("Sumber Listrik"),
                 'fax': g("Fax"),
                 'telp': g("Telepon"),
                 'mail': g("Email"),
@@ -144,10 +170,8 @@ class KemendikCrawler:
                     email=?, website=?, operator=?, lintang=?, bujur=?, 
                     provinsi=COALESCE(NULLIF(?,''),provinsi), kabupaten=COALESCE(NULLIF(?,''),kabupaten), 
                     kecamatan=COALESCE(NULLIF(?,''),kecamatan), fase2_done=1 WHERE npsn=?""", 
-                    (data['link'], data['bp_d'], data['pembina'], data['naungan'], data['npyp'], data['sk_p'], data['tgl_p'],
-                     data['sk_o'], data['tgl_o'], data['sk_l'], data['tgl_u'], data['akr'], data['akr_l'],
-                     data['luas'], i1, i2, data['listrik'], data['fax'], data['telp'], data['mail'], data['web'], 
-                     data['ops'], data['lat'], data['lng'], data['pr_r'], data['kb_r'], data['kc_r'], npsn))
+                    (d['nlink'], d['bpd'], d['pemb'], d['naung'], d['npyp'], d['skp'], d['tglp'], d['sko'], d['tglo'], d['skol'], d['tglu'], d['akr'], d['akrl'],
+                     d['luas'], i1, i2, d['list'], d['fax'], d['telp'], d['mail'], d['web'], d['ops'], d['lat'], d['lng'], d['pr_r'], d['kb_r'], d['kc_r'], npsn))
                 conn.commit()
         except: pass
 
@@ -155,14 +179,15 @@ class KemendikCrawler:
         self.fase2_active = True
         while self.fase2_active:
             with get_connection() as conn:
-                todo = conn.execute("SELECT npsn FROM sekolah WHERE fase2_done=0 LIMIT 20").fetchall()
-            if not todo:
-                self.fase2_active = False
-                break
-            with ThreadPoolExecutor(max_workers=10) as ex:
-                for r in todo:
-                    if not self.fase2_active: return
-                    ex.submit(self.fetch_detail, r['npsn'])
-                    time.sleep(0.1)
+                todo = conn.execute("SELECT npsn FROM sekolah WHERE fase2_done=0 LIMIT 100").fetchall()
+            if not todo: break
+            
+            with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
+                futures = [ex.submit(self.fetch_detail, r['npsn']) for r in todo]
+                for future in as_completed(futures):
+                    if not self.fase2_active:
+                        ex.shutdown(wait=False, cancel_futures=True)
+                        return
+        self.fase2_active = False
 
 crawler_instance = KemendikCrawler()

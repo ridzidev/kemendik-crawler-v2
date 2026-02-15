@@ -5,17 +5,19 @@ DB_NAME = "sekolah.db"
 def get_connection():
     conn = sqlite3.connect(DB_NAME, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    # Mode Kebut WAL
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
 
 def init_db():
     conn = get_connection()
     cursor = conn.cursor()
     
-    # Satu tabel untuk semua informasi (30+ Kolom)
+    # Tabel Sekolah dengan SEMUA Kolom Fase 1 & 2
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS sekolah (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        -- FASE 1
         npsn TEXT UNIQUE,
         nama TEXT,
         status TEXT,
@@ -26,7 +28,7 @@ def init_db():
         kabupaten TEXT,
         provinsi TEXT,
         
-        -- FASE 2 (Identitas & Perijinan)
+        -- Detail Fase 2
         npsn_link TEXT,
         bentuk_pendidikan_detail TEXT,
         kementerian_pembina TEXT,
@@ -40,24 +42,17 @@ def init_db():
         tgl_upload_sk TEXT,
         akreditasi TEXT,
         akreditasi_link TEXT,
-        
-        -- FASE 2 (Sarpras)
         luas_tanah TEXT,
         internet_1 TEXT,
         internet_2 TEXT,
         sumber_listrik TEXT,
-        
-        -- FASE 2 (Kontak)
         fax TEXT,
         telepon TEXT,
         email TEXT,
         website TEXT,
         operator TEXT,
-        
-        -- FASE 2 (Peta)
         lintang TEXT,
         bujur TEXT,
-        
         fase2_done INTEGER DEFAULT 0
     )""")
 
@@ -75,4 +70,4 @@ def init_db():
     cursor.execute("INSERT OR IGNORE INTO progress (id, prov, kab, kec, is_running, fase2_running) VALUES (1, 1, 1, 1, 0, 0)")
     conn.commit()
     conn.close()
-    print("✅ Database Siap.")
+    print("✅ DB Fresh & Fully Synced.")
