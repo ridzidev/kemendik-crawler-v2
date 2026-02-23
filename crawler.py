@@ -34,7 +34,8 @@ class KemendikCrawler:
         kode6 = f"{p:02}{k:02}{kc:02}"
         self.live_kode = kode6
         
-        url = f"{self.base_url}/pendidikan/dikdas/{kode6}/3"
+        # url = f"{self.base_url}/pendidikan/dikdas/{kode6}/3"
+        url = f"{self.base_url}/pendidikan/dikmen/{kode6}/3"
         try:
             resp = self.session.get(url, timeout=10)
             if resp.status_code != 200 or "Data tidak ditemukan" in resp.text:
@@ -62,9 +63,13 @@ class KemendikCrawler:
             for row in rows:
                 c = row.find_all("td")
                 if len(c) < 6: continue
+                # batch.append((
+                #     c[1].text.strip(), c[2].text.strip(), c[5].text.strip(),
+                #     "DIKDAS", c[3].text.strip(), c[4].text.strip(), kec_n, kab_n, prov_n
+                # ))
                 batch.append((
                     c[1].text.strip(), c[2].text.strip(), c[5].text.strip(),
-                    "DIKDAS", c[3].text.strip(), c[4].text.strip(), kec_n, kab_n, prov_n
+                    "DIKMEN", c[3].text.strip(), c[4].text.strip(), kec_n, kab_n, prov_n
                 ))
             
             if batch:

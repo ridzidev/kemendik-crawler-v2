@@ -31,6 +31,7 @@ def viewer():
     conn.close()
     return render_template("viewer.html", rows=rows, total_data=total_all, total_enriched=total_enriched, pending=(total_all-total_enriched), page=page, total_pages=(total_filtered//per_page)+1, search=search, view_filter=view_filter)
 
+
 @app.route("/api/stats")
 def stats():
     conn = get_connection()
