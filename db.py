@@ -5,7 +5,7 @@ DB_NAME = "sekolah.db"
 def get_connection():
     conn = sqlite3.connect(DB_NAME, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    # Mode Kebut WAL
+    # Mode Kebut WAL (Write-Ahead Logging)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
@@ -14,7 +14,8 @@ def init_db():
     conn = get_connection()
     cursor = conn.cursor()
     
-    # Tabel Sekolah dengan SEMUA Kolom Fase 1 & 2
+    # 1. Tabel Sekolah (DATA FINAL)
+    # Gue tambahin constraint UNIQUE biar gak duplikat NPSN
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS sekolah (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,18 +57,23 @@ def init_db():
         fase2_done INTEGER DEFAULT 0
     )""")
 
-    # Tabel Progress
+    # 2. Tabel Antrian Wilayah (PENGGANTI PROGRESS LAMA)
+    # Ini otak dari algoritma baru lo.
+    # kode: misal '010000', '010100', '010101'
+    # level: 1 (Prov), 2 (Kab), 3 (Kec - Siap Panen)
+    # status: 0 (Belum discan), 1 (Sudah discan/selesai)
     cursor.execute("""
-    CREATE TABLE IF NOT EXISTS progress (
-        id INTEGER PRIMARY KEY,
-        prov INTEGER DEFAULT 1,
-        kab INTEGER DEFAULT 1,
-        kec INTEGER DEFAULT 1,
-        is_running INTEGER DEFAULT 0,
-        fase2_running INTEGER DEFAULT 0
+    CREATE TABLE IF NOT EXISTS wilayah_queue (
+        kode TEXT PRIMARY KEY,
+        nama TEXT,
+        level INTEGER,
+        parent_kode TEXT,
+        status INTEGER DEFAULT 0
     )""")
 
-    cursor.execute("INSERT OR IGNORE INTO progress (id, prov, kab, kec, is_running, fase2_running) VALUES (1, 1, 1, 1, 0, 0)")
     conn.commit()
     conn.close()
-    print("✅ DB Fresh & Fully Synced.")
+    print("✅ DB Fresh & Ready for Hierarchy Crawling.")
+
+if __name__ == "__main__":
+    init_db()

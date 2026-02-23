@@ -1,170 +1,196 @@
 import requests
-import time
 import re
+import time
+import urllib3
 from bs4 import BeautifulSoup
 from db import get_connection
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# Matikan warning SSL dari urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class KemendikCrawler:
-    def __init__(self, max_workers=15):
-        self.base_url = "https://referensi.data.kemendikdasmen.go.id"
+    def __init__(self, max_workers=5):
+        self.base_url = "https://referensi.data.kemendikdasmen.go.id/pendidikan/dikmen"
+        self.root_url = "https://referensi.data.kemendikdasmen.go.id/pendidikan/dikmen"
+        
         self.session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(pool_connections=max_workers, pool_maxsize=max_workers)
+        retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+        adapter = HTTPAdapter(pool_connections=max_workers, pool_maxsize=max_workers, max_retries=retries)
         self.session.mount('https://', adapter)
+        
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
         })
-        self.max_workers = max_workers
+        self.session.verify = False # Bypass SSL
+        
         self.is_active = False
         self.fase2_active = False
-        self.live_kode = "000000"
-        self.live_npsn = "Pending"
+        self.live_kode = "IDLE"
+        self.live_npsn = "-"
 
-    # --- HELPER UPDATE PROGRESS KE DB ---
-    def update_db_progress(self, p, k, kc):
+    def _get_soup(self, url):
         try:
+            resp = self.session.get(url, timeout=20)
+            if resp.status_code == 200:
+                return BeautifulSoup(resp.text, "html.parser")
+        except Exception as e:
+            pass
+        return None
+
+    # --- PARSER FASE 1 ---
+    def _parse_region_table(self, soup, child_level):
+        results = []
+        if not soup: return results
+        table = soup.find("table", {"id": "table1"})
+        if not table: return results
+
+        for row in table.find("tbody").find_all("tr"):
+            link_td = row.find("td", {"class": "link1"})
+            if link_td and link_td.find("a"):
+                a_tag = link_td.find("a")
+                href = a_tag.get('href', '')
+                nama = a_tag.text.strip()
+                match = re.search(rf"dikmen/(\d{{6}})/{child_level}", href)
+                if match:
+                    results.append({'kode': match.group(1), 'nama': nama, 'level': child_level})
+        return results
+
+    def _parse_school_table(self, soup):
+        schools = []
+        if not soup: return schools
+        table = soup.find("table", {"id": "table1"})
+        if not table: return schools
+
+        for row in table.find("tbody").find_all("tr"):
+            cols = row.find_all("td")
+            if len(cols) >= 6:
+                try:
+                    schools.append((
+                        cols[1].text.strip(), cols[2].text.strip(), cols[5].text.strip(),
+                        "DIKMEN", cols[3].text.strip(), cols[4].text.strip()
+                    ))
+                except: continue
+        return schools
+
+    def seed_root(self):
+        print("\n🌱 Seeding Provinsi dari web...")
+        soup = self._get_soup(self.root_url)
+        provinces = self._parse_region_table(soup, 1)
+        if provinces:
+            data = [(p['kode'], p['nama'], 1, 'ROOT', 0) for p in provinces]
             with get_connection() as conn:
-                conn.execute("UPDATE progress SET prov=?, kab=?, kec=? WHERE id=1", (p, k, kc))
+                conn.executemany("INSERT OR IGNORE INTO wilayah_queue VALUES (?,?,?,?,?)", data)
                 conn.commit()
-        except: pass
+            print(f"✅ {len(provinces)} Provinsi siap antri.")
 
-    # --- FASE 1: WORKER ---
-    def fetch_kecamatan(self, p, k, kc):
-        if not self.is_active: return
-        kode6 = f"{p:02}{k:02}{kc:02}"
-        self.live_kode = kode6
-        
-        # url = f"{self.base_url}/pendidikan/dikdas/{kode6}/3"
-        url = f"{self.base_url}/pendidikan/dikmen/{kode6}/3"
-        try:
-            resp = self.session.get(url, timeout=10)
-            if resp.status_code != 200 or "Data tidak ditemukan" in resp.text:
-                self.update_db_progress(p, k, kc)
-                return
-            
-            soup = BeautifulSoup(resp.text, "html.parser")
-            prov_n, kab_n, kec_n = f"PROV_{p:02}", f"KAB_{k:02}", f"KEC_{kc:02}"
-            
-            # Parsing Breadcrumb (Anti-Trim)
-            bc_el = soup.find(lambda tag: tag.name == "div" and "Indonesia" in tag.text)
-            if bc_el:
-                parts = [x.strip() for x in re.split(r'>>|»', bc_el.get_text(strip=True))]
-                if len(parts) > 1: prov_n = parts[1]
-                if len(parts) > 2: kab_n = parts[2]
-                if len(parts) > 3: kec_n = parts[3].split("DAFTAR")[0].strip()
-
-            table = soup.find("table", {"id": "table1"})
-            if not table: 
-                self.update_db_progress(p, k, kc)
-                return
-            
-            rows = table.find("tbody").find_all("tr")
-            batch = []
-            for row in rows:
-                c = row.find_all("td")
-                if len(c) < 6: continue
-                # batch.append((
-                #     c[1].text.strip(), c[2].text.strip(), c[5].text.strip(),
-                #     "DIKDAS", c[3].text.strip(), c[4].text.strip(), kec_n, kab_n, prov_n
-                # ))
-                batch.append((
-                    c[1].text.strip(), c[2].text.strip(), c[5].text.strip(),
-                    "DIKMEN", c[3].text.strip(), c[4].text.strip(), kec_n, kab_n, prov_n
-                ))
-            
-            if batch:
-                with get_connection() as conn:
-                    conn.executemany("""INSERT OR IGNORE INTO sekolah 
-                    (npsn, nama, status, bentuk_pendidikan, alamat, desa, kecamatan, kabupaten, provinsi) 
-                    VALUES (?,?,?,?,?,?,?,?,?)""", batch)
-                    conn.commit()
-            
-            self.update_db_progress(p, k, kc)
-        except:
-            self.update_db_progress(p, k, kc)
-
-    def run_f1(self):
-        self.is_active = True
+    def run_fase1(self):
+        print("\n🚀 CRAWLER FASE 1 AKTIF!")
         with get_connection() as conn:
-            prg = conn.execute("SELECT * FROM progress WHERE id=1").fetchone()
-        
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            for p in range(prg['prov'], 40):
-                if not self.is_active: break
-                for k in range(prg['kab'] if p == prg['prov'] else 1, 100):
-                    if not self.is_active: break
-                    
-                    futures = []
-                    start_kc = prg['kec'] if (p == prg['prov'] and k == prg['kab']) else 1
-                    for kc in range(start_kc, 100):
-                        if not self.is_active: break
-                        futures.append(executor.submit(self.fetch_kecamatan, p, k, kc))
-                    
-                    # Cek hasil dan berikan kesempatan untuk Pause
-                    for future in as_completed(futures):
-                        if not self.is_active:
-                            executor.shutdown(wait=False, cancel_futures=True)
-                            return
-            
-        self.is_active = False
+            if conn.execute("SELECT count(*) as t FROM wilayah_queue").fetchone()['t'] == 0:
+                self.seed_root()
 
-    # --- FASE 2: FULL DATA ENRICHMENT ---
+        while self.is_active:
+            with get_connection() as conn:
+                task = conn.execute("SELECT * FROM wilayah_queue WHERE status=0 ORDER BY level DESC LIMIT 1").fetchone()
+            
+            if not task:
+                print("\n🏁 Selesai. Menunggu task baru...")
+                time.sleep(2)
+                continue
+
+            kode, nama, level = task['kode'], task['nama'], task['level']
+            self.live_kode = f"{nama} (L{level})"
+            
+            # Logger console
+            indent = "  " * level
+            icon = "🏢" if level == 1 else "🏙️" if level == 2 else "🌾"
+            print(f"{indent}{icon} Fetch [{level}]: {nama}", end="\r")
+
+            soup = self._get_soup(f"{self.base_url}/{kode}/{level}")
+            
+            if level < 3:
+                children = self._parse_region_table(soup, level + 1)
+                if children:
+                    db_data = [(c['kode'], c['nama'], level + 1, kode, 0) for c in children]
+                    with get_connection() as conn:
+                        conn.executemany("INSERT OR IGNORE INTO wilayah_queue VALUES (?,?,?,?,?)", db_data)
+                        conn.execute("UPDATE wilayah_queue SET status=1 WHERE kode=?", (kode,))
+                        conn.commit()
+                    print(f"{indent}{icon} Fetch [{level}]: {nama} -> Dapet {len(children)} anak.")
+                else:
+                    with get_connection() as conn:
+                        conn.execute("UPDATE wilayah_queue SET status=1 WHERE kode=?", (kode,))
+                        conn.commit()
+
+            elif level == 3:
+                sekolah = self._parse_school_table(soup)
+                if sekolah:
+                    with get_connection() as conn:
+                        p1 = conn.execute("SELECT nama, parent_kode FROM wilayah_queue WHERE kode=?", (task['parent_kode'],)).fetchone()
+                        kab_nama = p1['nama'] if p1 else ""
+                        p2 = conn.execute("SELECT nama FROM wilayah_queue WHERE kode=?", (p1['parent_kode'],)).fetchone() if p1 else None
+                        prov_nama = p2['nama'] if p2 else ""
+                        
+                        final_data = [s + (nama, kab_nama, prov_nama) for s in sekolah]
+                        
+                        conn.executemany("""INSERT OR IGNORE INTO sekolah 
+                        (npsn, nama, status, bentuk_pendidikan, alamat, desa, kecamatan, kabupaten, provinsi) 
+                        VALUES (?,?,?,?,?,?,?,?,?)""", final_data)
+                        conn.execute("UPDATE wilayah_queue SET status=1 WHERE kode=?", (kode,))
+                        conn.commit()
+                    print(f"{indent}{icon} PANEN [{level}]: {nama} -> {len(sekolah)} Sekolah.")
+                else:
+                    with get_connection() as conn:
+                        conn.execute("UPDATE wilayah_queue SET status=1 WHERE kode=?", (kode,))
+                        conn.commit()
+            
+            time.sleep(0.5)
+
+    # --- PARSER FASE 2 ---
     def fetch_detail(self, npsn):
         if not self.fase2_active: return
         self.live_npsn = npsn
-        url = f"{self.base_url}/tabs.php?npsn={npsn}"
+        url = f"https://referensi.data.kemendikdasmen.go.id/tabs.php?npsn={npsn}"
         try:
-            resp = self.session.get(url, timeout=20)
+            resp = self.session.get(url, timeout=15)
             if resp.status_code != 200: return
             soup = BeautifulSoup(resp.text, "html.parser")
 
             def g(label):
-                target = soup.find("td", string=re.compile(f"^{label}$", re.I))
-                if target:
-                    val_td = target.find_next_sibling("td")
-                    if val_td and val_td.text.strip() == ":":
-                        val_td = val_td.find_next_sibling("td")
-                    return val_td.get_text(strip=True) if val_td else ""
+                t = soup.find("td", string=re.compile(f"^{label}$", re.I))
+                if t and t.find_next_sibling("td"):
+                    v = t.find_next_sibling("td")
+                    if v.text.strip() == ":": v = v.find_next_sibling("td")
+                    return v.get_text(strip=True) if v else ""
                 return ""
 
-            # Internet
+            lat = re.search(r"Lintang:\s*([\-\d\.]+)", resp.text)
+            lng = re.search(r"Bujur:\s*([\-\d\.]+)", resp.text)
+            
+            d = {
+                'nlink': soup.select_one("a[href*='profil-sekolah']")['href'] if soup.select_one("a[href*='profil-sekolah']") else "",
+                'bpd': g("Bentuk Pendidikan"), 'pemb': g("Kementerian Pembina"), 'naung': g("Naungan"),
+                'npyp': g("NPYP"), 'skp': g("No. SK. Pendirian"), 'tglp': g("Tanggal SK. Pendirian"),
+                'sko': g("Nomor SK Operasional"), 'tglo': g("Tanggal SK Operasional"),
+                'skol': soup.find("a", string=re.compile("Lihat SK Operasional", re.I))['href'] if soup.find("a", string=re.compile("Lihat SK Operasional", re.I)) else "",
+                'tglu': g("Tanggal Upload SK Op."),
+                'akr': soup.find("a", href=re.compile("ban-pdm|satuanpendidikan", re.I)).text.strip() if soup.find("a", href=re.compile("ban-pdm|satuanpendidikan", re.I)) else "",
+                'akrl': soup.find("a", href=re.compile("ban-pdm|satuanpendidikan", re.I))['href'] if soup.find("a", href=re.compile("ban-pdm|satuanpendidikan", re.I)) else "",
+                'luas': g("Luas Tanah"), 'list': g("Sumber Listrik"), 'fax': g("Fax"),
+                'telp': g("Telepon"), 'mail': g("Email"), 'web': g("Website"), 'ops': g("Operator"),
+                'lat': lat.group(1) if lat else "", 'lng': lng.group(1) if lng else "",
+            }
+
             i1, i2 = "", ""
             itd = soup.find("td", string=re.compile("Akses Internet", re.I))
             if itd:
                 i1 = itd.find_next_sibling("td").find_next_sibling("td").text.strip()
                 row2 = itd.find_parent("tr").find_next_sibling("tr")
-                if row2:
-                    c2 = row2.find_all("td")
-                    if len(c2) > 0: i2 = c2[-1].text.strip()
-
-            # Mapping SEMUA Kolom
-            d = {
-                'nlink': soup.select_one("a[href*='profil-sekolah']")['href'] if soup.select_one("a[href*='profil-sekolah']") else "",
-                'bpd': g("Bentuk Pendidikan"),
-                'pemb': g("Kementerian Pembina"),
-                'naung': g("Naungan"),
-                'npyp': g("NPYP"),
-                'skp': g("No. SK. Pendirian"),
-                'tglp': g("Tanggal SK. Pendirian"),
-                'sko': g("Nomor SK Operasional"),
-                'tglo': g("Tanggal SK Operasional"),
-                'skol': soup.find("a", string=re.compile("Lihat SK Operasional", re.I))['href'] if soup.find("a", string=re.compile("Lihat SK Operasional", re.I)) else "",
-                'tglu': g("Tanggal Upload SK Op."),
-                'akr': soup.find("a", href=re.compile("ban-pdm|satuanpendidikan", re.I)).text.strip() if soup.find("a", href=re.compile("ban-pdm|satuanpendidikan", re.I)) else "",
-                'akrl': soup.find("a", href=re.compile("ban-pdm|satuanpendidikan", re.I))['href'] if soup.find("a", href=re.compile("ban-pdm|satuanpendidikan", re.I)) else "",
-                'luas': g("Luas Tanah"),
-                'list': g("Sumber Listrik"),
-                'fax': g("Fax"),
-                'telp': g("Telepon"),
-                'mail': g("Email"),
-                'web': g("Website"),
-                'ops': g("Operator"),
-                'lat': re.search(r"Lintang:\s*([\-\d\.]+)", resp.text).group(1) if re.search(r"Lintang:\s*([\-\d\.]+)", resp.text) else "",
-                'lng': re.search(r"Bujur:\s*([\-\d\.]+)", resp.text).group(1) if re.search(r"Bujur:\s*([\-\d\.]+)", resp.text) else "",
-                'pr_r': g("Propinsi/Luar Negeri \(LN\)"),
-                'kb_r': g("Kab.-Kota/Negara \(LN\)"),
-                'kc_r': g("Kecamatan/Kota \(LN\)")
-            }
+                if row2 and len(row2.find_all("td")) > 0: 
+                    i2 = row2.find_all("td")[-1].text.strip()
 
             with get_connection() as conn:
                 conn.execute("""UPDATE sekolah SET 
@@ -172,27 +198,28 @@ class KemendikCrawler:
                     sk_pendirian=?, tgl_sk_pendirian=?, sk_operasional=?, tgl_sk_operasional=?, 
                     sk_operasional_link=?, tgl_upload_sk=?, akreditasi=?, akreditasi_link=?, 
                     luas_tanah=?, internet_1=?, internet_2=?, sumber_listrik=?, fax=?, telepon=?, 
-                    email=?, website=?, operator=?, lintang=?, bujur=?, 
-                    provinsi=COALESCE(NULLIF(?,''),provinsi), kabupaten=COALESCE(NULLIF(?,''),kabupaten), 
-                    kecamatan=COALESCE(NULLIF(?,''),kecamatan), fase2_done=1 WHERE npsn=?""", 
+                    email=?, website=?, operator=?, lintang=?, bujur=?, fase2_done=1 WHERE npsn=?""", 
                     (d['nlink'], d['bpd'], d['pemb'], d['naung'], d['npyp'], d['skp'], d['tglp'], d['sko'], d['tglo'], d['skol'], d['tglu'], d['akr'], d['akrl'],
-                     d['luas'], i1, i2, d['list'], d['fax'], d['telp'], d['mail'], d['web'], d['ops'], d['lat'], d['lng'], d['pr_r'], d['kb_r'], d['kc_r'], npsn))
+                     d['luas'], i1, i2, d['list'], d['fax'], d['telp'], d['mail'], d['web'], d['ops'], d['lat'], d['lng'], npsn))
                 conn.commit()
+            print(f"  [Fase 2] ✅ NPSN: {npsn} OK.", end="\r")
         except: pass
 
-    def run_f2(self):
+    def run_fase2(self):
+        print("\n🚀 CRAWLER FASE 2 AKTIF!")
         self.fase2_active = True
         while self.fase2_active:
             with get_connection() as conn:
-                todo = conn.execute("SELECT npsn FROM sekolah WHERE fase2_done=0 LIMIT 100").fetchall()
-            if not todo: break
+                todo = conn.execute("SELECT npsn FROM sekolah WHERE fase2_done=0 LIMIT 50").fetchall()
+            if not todo: 
+                print("\n🏁 Fase 2 Selesai. Semua detail sudah diambil.")
+                break
             
-            with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
-                futures = [ex.submit(self.fetch_detail, r['npsn']) for r in todo]
-                for future in as_completed(futures):
-                    if not self.fase2_active:
-                        ex.shutdown(wait=False, cancel_futures=True)
-                        return
+            for row in todo:
+                if not self.fase2_active: break
+                self.fetch_detail(row['npsn'])
+                time.sleep(0.2)
+                
         self.fase2_active = False
 
 crawler_instance = KemendikCrawler()
